@@ -20,6 +20,7 @@ import argparse
 import glob
 import logging
 import os
+import re
 import random
 
 import numpy as np
@@ -85,6 +86,14 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
+def find_checkpoints(directory):
+    checkpoints = list(
+            os.path.dirname(c) for c in sorted(glob.glob(directory + "/**/" + WEIGHTS_NAME, recursive=True)))
+    checkpoints = filter(lambda x: 'checkpoint' in x, checkpoints)
+    checkpoints = [(int(re.match('.*-([0-9]+)', x).group(1)), x) for x in checkpoints]
+    checkpoints = sorted(checkpoints)
+    checkpoints = [x[1] for x in checkpoints]
+    return checkpoints
 
 def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
     """ Train the model """
@@ -158,7 +167,33 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
     epochs_trained = 0
     steps_trained_in_current_epoch = 0
     # Check if continuing training from a checkpoint
-    if os.path.exists(args.model_name_or_path):
+    checkpoints = find_checkpoints(args.output_dir)
+    if args.continue_training and len(checkpoints) > 0:
+        checkpoint = checkpoints[-1]
+        model.load_state_dict(torch.load(os.path.join(checkpoint, 'pytorch_model.bin')))
+        global_step = int(checkpoint.split('-')[-1])
+        epochs_trained = global_step // (len(train_dataloader) // args.gradient_accumulation_steps)
+        steps_trained_in_current_epoch = global_step % (len(train_dataloader) // args.gradient_accumulation_steps)
+
+        logger.info("  Continuing training from checkpoint %s, will skip to saved global_step", checkpoint)
+        logger.info("  Continuing training from epoch %d", epochs_trained)
+        logger.info("  Continuing training from global step %d", global_step)
+        logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
+
+        scheduler_file = os.path.join(checkpoint, 'scheduler.pt')
+        if os.path.exists(scheduler_file):
+            scheduler.load_state_dict(torch.load(scheduler_file))
+            logger.info("Loading scheduler from %s", scheduler_file)
+        else:
+            logger.warn("No scheduler file %s found; cannot resume scheduler state!", scheduler_file)
+
+        optimizer_file = os.path.join(checkpoint, 'optimizer.pt')
+        if os.path.exists(optimizer_file):
+            optimizer.load_state_dict(torch.load(optimizer_file))
+            logger.info("Loading optimizer from %s", optimizer_file)
+        else:
+            logger.warn("No optimizer file %s found; cannot resume optimizer state!", optimizer_file)
+    elif os.path.exists(args.model_name_or_path) and re.match('.*-[0-9]+', args.model_name_or_path):
         # set global_step to gobal_step of last saved checkpoint from model path
         global_step = int(args.model_name_or_path.split("-")[-1].split("/")[0])
         epochs_trained = global_step // (len(train_dataloader) // args.gradient_accumulation_steps)
@@ -168,6 +203,20 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
         logger.info("  Continuing training from epoch %d", epochs_trained)
         logger.info("  Continuing training from global step %d", global_step)
         logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
+
+        scheduler_file = os.path.join(args.model_name_or_path, 'scheduler.pt')
+        if os.path.exists(scheduler_file):
+            scheduler.load_state_dict(torch.load(scheduler_file))
+            logger.info("Loading scheduler from %s", scheduler_file)
+        else:
+            logger.warn("No scheduler file %s found; cannot resume scheduler state!", scheduler_file)
+
+        optimizer_file = os.path.join(args.model_name_or_path, 'optimizer.pt')
+        if os.path.exists(optimizer_file):
+            optimizer.load_state_dict(torch.load(optimizer_file))
+            logger.info("Loading optimizer from %s", optimizer_file)
+        else:
+            logger.warn("No optimizer file %s found; cannot resume optimizer state!", optimizer_file)
 
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
@@ -497,6 +546,9 @@ def main():
         "--overwrite_output_dir", action="store_true", help="Overwrite the content of the output directory"
     )
     parser.add_argument(
+        "--continue_training", action="store_true", help="Continue training from an existing saved model"
+    )
+    parser.add_argument(
         "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
@@ -523,6 +575,7 @@ def main():
         and os.listdir(args.output_dir)
         and args.do_train
         and not args.overwrite_output_dir
+        and not args.continue_training
     ):
         raise ValueError(
             "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
@@ -604,8 +657,8 @@ def main():
 
     logger.info("Training/evaluation parameters %s", args)
 
-    # Training
-    if args.do_train:
+    # Training, unless a poor man's method of checking for done-ness works
+    if args.do_train and not os.path.exists(os.path.join(args.output_dir, 'config.json')):
         train_dataset = load_and_cache_examples(args, tokenizer, labels, pad_token_label_id, mode="train")
         global_step, tr_loss = train(args, train_dataset, model, tokenizer, labels, pad_token_label_id)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
@@ -634,9 +687,7 @@ def main():
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
-            checkpoints = list(
-                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + "/**/" + WEIGHTS_NAME, recursive=True))
-            )
+            checkpoints = checkpoints + find_checkpoints(args.output_dir)
             logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         for checkpoint in checkpoints:
