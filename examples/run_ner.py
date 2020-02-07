@@ -26,6 +26,7 @@ import random
 import numpy as np
 import torch
 from seqeval.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics import classification_report
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
@@ -331,11 +332,13 @@ def evaluate(args, model, tokenizer, labels, pad_token_label_id, mode, prefix=""
     preds = None
     out_label_ids = None
     model.eval()
+    words = []
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         batch = tuple(t.to(args.device) for t in batch)
 
         with torch.no_grad():
             inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+            words.extend(batch[0].cpu())
             if args.model_type != "distilbert":
                 inputs["token_type_ids"] = (
                     batch[2] if args.model_type in ["bert", "xlnet"] else None
@@ -363,23 +366,57 @@ def evaluate(args, model, tokenizer, labels, pad_token_label_id, mode, prefix=""
     out_label_list = [[] for _ in range(out_label_ids.shape[0])]
     preds_list = [[] for _ in range(out_label_ids.shape[0])]
 
+    out_label_list_id = []
+    preds_list_id = []
+
     for i in range(out_label_ids.shape[0]):
         for j in range(out_label_ids.shape[1]):
             if out_label_ids[i, j] != pad_token_label_id:
                 out_label_list[i].append(label_map[out_label_ids[i][j]])
                 preds_list[i].append(label_map[preds[i][j]])
+                out_label_list_id.append(out_label_ids[i][j])
+                preds_list_id.append(preds[i][j])
 
+    word_preds = []
+    word_labels = []
+    for i in range(len(words)):
+        for j in range(len(words[i])):
+            tok = tokenizer.decode(words[i][j:j+1])
+            if out_label_ids[i, j] != pad_token_label_id and not tok.startswith('##') and not ('[' in tok and ']' in tok):
+                word_preds.append(out_label_ids[i][j])
+                word_labels.append(preds[i][j])
+    target_names = [x[1] for x in sorted(label_map.items())]
+    sk_report = classification_report(word_labels,
+                                      word_preds,
+                                      target_names=target_names,
+                                      digits=3,
+                                      output_dict=True)
+
+    f1s = [sk_report[x]['f1-score'] for x in (set(target_names) - set(['O']))]
+    f1 = sum(f1s) / len(f1s)
     results = {
         "loss": eval_loss,
         "precision": precision_score(out_label_list, preds_list),
         "recall": recall_score(out_label_list, preds_list),
         "f1": f1_score(out_label_list, preds_list),
+        "sk_f1": sk_report['macro avg']['f1-score'],
+        "macro_sk_avg_pos_only": f1,
     }
 
     logger.info("***** Eval results %s *****", prefix)
     for key in sorted(results.keys()):
         logger.info("  %s = %s", key, str(results[key]))
 
+    logger.info("wordpiece classification report:\n%s",
+                classification_report(out_label_list_id,
+                                      preds_list_id,
+                                      target_names=target_names,
+                                      digits=3))
+    logger.info("word level classification report:\n%s",
+                classification_report(word_labels,
+                                      word_preds,
+                                      target_names=target_names,
+                                      digits=3))
     return results, preds_list
 
 
