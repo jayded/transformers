@@ -755,16 +755,22 @@ def main():
         with open(output_test_predictions_file, "w") as writer:
             with open(os.path.join(args.data_dir, "test.txt"), "r") as f:
                 example_id = 0
-                for line in f:
+                pos = 0
+                lines = f.readlines()
+                while pos < len(lines):
+                    line = lines[pos]
                     if line.startswith("-DOCSTART-") or line == "" or line == "\n":
                         writer.write(line)
                         if not predictions[example_id]:
                             example_id += 1
+                            while pos + 1 < len(lines) and lines[pos + 1] == '\n':
+                                pos += 1
                     elif predictions[example_id]:
                         output_line = line.split()[0] + " " + predictions[example_id].pop(0) + "\n"
                         writer.write(output_line)
                     else:
                         logger.warning("Maximum sequence length exceeded: No prediction for '%s'.", line.split()[0])
+                    pos += 1
 
     return results
 
